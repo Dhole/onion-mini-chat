@@ -1,0 +1,14 @@
+# Tor config for onion-mini-chat
+
+DataDirectory data
+DirReqStatistics 0
+#GeoIPFile geoip\geoip
+#GeoIPv6File geoip\geoip6
+
+# Log notice file data\notice.log
+
+SOCKSPort 9060
+ControlPort 9061
+
+CookieAuthentication 1
+CookieAuthFile tor.control.authcookie

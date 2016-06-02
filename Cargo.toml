@@ -1,0 +1,11 @@
+[package]
+name = "onion-mini-chat"
+version = "0.1.0"
+authors = ["Dhole <dhole@openmailbox.org>"]
+
+[dependencies]
+tor_controller = { path = "../rust-tor-controller" }
+env_logger = "0.3"
+socks = "0.2.1"
+rustylinez = { path = "../rustylinez" }
+colored = "1.2"
