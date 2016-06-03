@@ -3,26 +3,26 @@ extern crate env_logger;
 extern crate tor_controller;
 extern crate socks;
 extern crate rustylinez;
-extern crate colored;
 
-use tor_controller::control::{Controller, OnionKey, KeyType, OnionFlags, AddOnion};
+use tor_controller::control::{Controller, OnionKey, KeyType, AddOnion};
 use tor_controller::process::TorProcess;
 use rustylinez::completion::FilenameCompleter;
 use rustylinez::error::ReadlineError;
-use rustylinez::{Editor, Input, Printer};
-use colored::*;
+use rustylinez::{Editor, Printer};
 use std::time::Duration;
 use socks::Socks5Stream;
 use std::io::{Read, Write, ErrorKind};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::thread;
+use std::thread::JoinHandle;
+use std::sync::{RwLock, Arc};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::collections::HashMap;
 use std::io::{BufReader, BufRead, BufWriter};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::fmt;
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Hash, Clone)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
 struct Id([u8; 16]);
 
 impl fmt::Display for Id {
@@ -43,6 +43,103 @@ impl Id {
             Some(id)
         }
     }
+
+    fn to_onion(&self) -> String {
+        format!("{}.onion", self)
+    }
+}
+
+struct Friend {
+    id: Id,
+    nickname: String,
+    tx: Sender<FriendCmd>,
+    is_online: Arc<RwLock<bool>>,
+    handler: JoinHandle<()>,
+}
+
+struct FriendList {
+    map: HashMap<String, Friend>,
+    nicknames: Vec<String>,
+    map_id_nickname: HashMap<Id, String>,
+    own_id: Id,
+    file: File,
+    main_tx: Sender<Cmd>,
+}
+
+impl FriendList {
+    fn new(path: &str, id: Id, main_tx: Sender<Cmd>) -> FriendList {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)
+            .unwrap();
+        let mut file_lines = Vec::new();
+        {
+            let file_reader = BufReader::new(&file);
+            file_lines = file_reader.lines().map(|l| l.unwrap()).collect::<Vec<_>>();
+        }
+        let mut friend_list = FriendList {
+            map: HashMap::new(),
+            nicknames: Vec::new(),
+            map_id_nickname: HashMap::new(),
+            own_id: id,
+            file: file,
+            main_tx: main_tx,
+        };
+        {
+            for line in file_lines {
+                let friend = line.trim().split(' ').collect::<Vec<_>>();
+                if friend.len() < 2 {
+                    continue;
+                }
+                let id = Id::from_slice(friend[0].as_bytes()).unwrap();
+                let nickname = friend[1];
+                friend_list.add_friend(id, nickname.to_string(), false);
+            }
+        }
+        return friend_list;
+    }
+
+    fn add_friend(&mut self, id: Id, nickname: String, new: bool) -> bool {
+        if self.nicknames.contains(&nickname) {
+            return false;
+        }
+        let nickname1 = nickname.clone();
+        self.nicknames.push(nickname1);
+        let is_online = Arc::new(RwLock::new(false));
+        let (tx, rx) = channel();
+        let is_online1 = is_online.clone();
+        let tx1 = tx.clone();
+        let id1 = id.clone();
+        let own_id1 = self.own_id.clone();
+        let nickname1 = nickname.clone();
+        let main_tx = self.main_tx.clone();
+        let handler = thread::spawn(move || {
+            friend_handler(own_id1, id1, nickname1, tx1, rx, main_tx, is_online1);
+        });
+        let friend = Friend {
+            id: id.clone(),
+            nickname: nickname.clone(),
+            tx: tx,
+            is_online: is_online,
+            handler: handler,
+        };
+        self.map.insert(nickname.clone(), friend);
+        self.map_id_nickname.insert(id.clone(), nickname.clone());
+        if new {
+            self.file.write_all(format!("{} {}\n", id, nickname).as_bytes()).unwrap();
+            self.file.flush().unwrap();
+        }
+        true
+    }
+}
+
+#[derive(Debug)]
+enum FriendCmd {
+    SendMsg(String),
+    Connected(TcpStream),
+    Disconnected,
 }
 
 #[derive(Debug)]
@@ -52,6 +149,7 @@ enum Cmd {
     Add(Id, String),
     List,
     Quit,
+    NewConnection(TcpStream),
     PeerConnect(String),
     PeerDisconnect(String),
     RecvMsg(String, String),
@@ -64,6 +162,11 @@ macro_rules! colorize {
 macro_rules! print_color {
     ($pl:expr, $col:expr, $fmt:expr) => ($pl(format!(colorize!($col,  $fmt))));
     ($pl:expr, $col:expr, $fmt:expr, $($arg:tt)*) => ($pl(format!(colorize!($col, $fmt), $($arg)*)));
+}
+
+macro_rules! print_normal {
+    ($pl:expr, $fmt:expr) => ($pl(format!($fmt)));
+    ($pl:expr, $fmt:expr, $($arg:tt)*) => ($pl(format!($fmt, $($arg)*)));
 }
 
 macro_rules! info {
@@ -86,7 +189,94 @@ macro_rules! print_msg_them {
     ($pl:expr, $name:expr, $msg:expr) => (print_msg!($pl, 201, $name, $msg));
 }
 
-fn tor_handler(printer: Printer, rx: Receiver<Cmd>, tx: Sender<Cmd>) {
+fn connect_friend(own_id: Id,
+                  friend_id: Id,
+                  rx: &Receiver<FriendCmd>) -> TcpStream {
+    if own_id < friend_id {
+        loop {
+            //println!("Trying to connecto to {}", friend_id);
+            match Socks5Stream::connect(("127.0.0.1", 9060),
+            (format!("{}", friend_id.to_onion()).as_str(), 9876)) {
+                Ok(stream) => {
+                    //println!("Connected to {}!", friend_id);
+                    let mut stream = stream.into_inner();
+                    stream.write_all(format!("{}\n", own_id).as_bytes()).unwrap();
+                    stream.flush().unwrap();
+                    return stream;
+                },
+                Err(_) => (),
+            }
+            thread::sleep(Duration::from_secs(5));
+        }
+    } else {
+        loop {
+            //println!("Waiting connection from {}", friend_id);
+            match rx.recv().unwrap() {
+                FriendCmd::Connected(stream) => {
+                    //println!("{} connected to us!", friend_id);
+                    return stream;
+                }
+                _ => (),
+            }
+        }
+    }
+}
+
+fn friend_handler(own_id: Id,
+                  friend_id: Id,
+                  nickname: String,
+                  tx: Sender<FriendCmd>,
+                  rx: Receiver<FriendCmd>,
+                  main_tx: Sender<Cmd>,
+                  is_online: Arc<RwLock<bool>>) {
+    let mut rx = rx;
+    let mut tx = tx;
+    let mut main_tx = main_tx;
+    loop {
+        let stream = connect_friend(own_id, friend_id, &rx);
+
+        let reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = BufWriter::new(stream.try_clone().unwrap());
+        *is_online.write().unwrap() = true;
+        main_tx.send(Cmd::PeerConnect(nickname.clone())).unwrap();
+
+        let nickname1 = nickname.clone();
+        let reader_handler = thread::spawn(move || {
+            for line in reader.lines() {
+                main_tx.send(Cmd::RecvMsg(nickname1.clone(), line.unwrap())).unwrap();
+            }
+            tx.send(FriendCmd::Disconnected).unwrap();
+            return (main_tx, tx);
+        });
+
+        let writer_handler = thread::spawn(move || {
+            for friend_cmd in &rx {
+                match friend_cmd {
+                    FriendCmd::SendMsg(msg) => {
+                        writer.write_all(msg.as_bytes()).unwrap();
+                        writer.write_all(b"\n").unwrap();
+                        writer.flush().unwrap();
+                    },
+                    FriendCmd::Disconnected => {
+                        break;
+                    },
+                    _ => (),
+                }
+            }
+            return rx;
+        });
+
+        rx = writer_handler.join().unwrap();
+        let (main_tx1, tx1) =  reader_handler.join().unwrap();
+        main_tx = main_tx1;
+        tx = tx1;
+
+        *is_online.write().unwrap() = false;
+        main_tx.send(Cmd::PeerDisconnect(nickname.clone())).unwrap();
+    }
+}
+
+fn main_handler(printer: Printer, rx: Receiver<Cmd>, tx: Sender<Cmd>) {
     let mut pr = printer.clone();
     let mut pl = move |s| pr.println(s);
     info!(pl, "Starting Tor Daemon...");
@@ -96,18 +286,6 @@ fn tor_handler(printer: Printer, rx: Receiver<Cmd>, tx: Sender<Cmd>) {
     info!(pl, "Connecting to Tor controller...");
     let mut controller = Controller::from_port(9061).unwrap();
     controller.authenticate().unwrap();
-
-    // thread::spawn(move || {
-    //    let mut pr = printer.clone();
-    //    let mut pl = move |s| pr.println(s);
-    //    loop {
-    //        thread::sleep(Duration::from_secs(2));
-    //        print_msg_me!(pl, "Dhole", "OLA K ASE");
-    //    }
-    // });
-
-    // let mut con = Socks5Stream::connect(("127.0.0.1", 9060), ("cripticavraowaqb.onion", 80))
-    //    .unwrap();
 
     let mut new_key = false;
     let onion_key = match File::open("key.txt") {
@@ -139,7 +317,8 @@ fn tor_handler(printer: Printer, rx: Receiver<Cmd>, tx: Sender<Cmd>) {
         client_auths: vec![],
     };
     let add_onion_rep = controller.cmd_add_onion(add_onion).unwrap();
-    info!(pl, "Your ID is: {}", add_onion_rep.service_id);
+    let own_id = Id::from_slice(add_onion_rep.service_id.as_bytes()).unwrap();
+    info!(pl, "Your ID is: {}", own_id);
     if new_key {
         match File::create("key.txt") {
             Ok(ref mut key_file) => {
@@ -151,69 +330,96 @@ fn tor_handler(printer: Printer, rx: Receiver<Cmd>, tx: Sender<Cmd>) {
             }
         }
     }
+
     let tx1 = tx.clone();
     thread::spawn(move || {
         let listener = TcpListener::bind(("127.0.0.1", 9876)).unwrap();
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    let con_r = BufReader::new(stream);
-                    for line in con_r.lines() {
-                        tx1.send(Cmd::RecvMsg("Unknown".to_string(), line.unwrap())).unwrap();
-                    }
+                    //println!("Someone has tried connecting to us!");
+                    tx1.send(Cmd::NewConnection(stream)).unwrap();
                 }
-                Err(e) => println!("Connection failed {:?}", e),
+                Err(e) => (),
             }
         }
     });
-    let mut current_chat_id: Option<Id> = None;
-    let mut connected_peers = HashMap::new();
-    let mut nicknames = HashMap::new();
+
+    let mut current_chat_nickname: Option<String> = None;
+    let tx1 = tx.clone();
+    let mut friend_list = FriendList::new("friends.txt", own_id, tx1);
     loop {
         match rx.recv().unwrap() {
             Cmd::SendMsg(msg) => {
-                if let Some(ref id) = current_chat_id {
-                    let tx: &Sender<String> = connected_peers.get_mut(id).unwrap();
-                    tx.send(msg.clone()).unwrap();
+                if let Some(ref nickname) = current_chat_nickname {
+                    let friend = friend_list.map.get_mut(nickname).unwrap();
+                    friend.tx.send(FriendCmd::SendMsg(msg.clone())).unwrap();
                     print_msg_me!(pl, "Me", msg);
                 }
             }
             Cmd::Add(id, nickname) => {
-                let (peer_tx, peer_rx) = channel();
-                let tx = tx.clone();
-                let id1 = id.clone();
-                let nickname1 = nickname.clone();
-                thread::spawn(move || {
-                    let con_r = Socks5Stream::connect(("127.0.0.1", 9060),
-                                                      (format!("{}.onion", id1).as_str(), 9876))
-                        .unwrap()
-                        .into_inner();
-                    let mut con_w = con_r.try_clone().unwrap();
-                    let reader = thread::spawn(move || {
-                        let con_r = BufReader::new(con_r);
-                        for line in con_r.lines() {
-                            tx.send(Cmd::RecvMsg(nickname1.clone(), line.unwrap())).unwrap();
-                        }
-                    });
-                    let writer = thread::spawn(move || {
-                        loop {
-                            let msg: String = peer_rx.recv().unwrap();
-                            con_w.write_all(msg.as_bytes()).unwrap();
-                            con_w.write_all(b"\n").unwrap();
-                            con_w.flush().unwrap();
-                        }
-                    });
-                });
-                current_chat_id = Some(id.clone());
-                connected_peers.insert(id.clone(), peer_tx);
-                nicknames.insert(nickname, id);
+                if !friend_list.add_friend(id, nickname.clone(), true) {
+                    error!(pl, "Error adding friend: nickname {} already found in your list",
+                           nickname);
+                }
             }
-            Cmd::Chat(nickname) => unimplemented!(),
-            Cmd::List => unimplemented!(),
+            Cmd::Chat(nickname) => {
+                if !friend_list.map.contains_key(&nickname) {
+                    error!(pl, "No friend found with nickname {}", nickname);
+                    continue;
+                }
+                if !*friend_list.map.get(&nickname).unwrap().is_online.read().unwrap() {
+                    error!(pl, "{} is currently offline", nickname);
+                    continue;
+                }
+                current_chat_nickname = Some(nickname.clone());
+                info!(pl, "Currently chatting with {}", nickname);
+            },
+            Cmd::List => {
+                let online = friend_list.nicknames.iter().map(|n| friend_list.map.get(n).unwrap())
+                    .filter(|f| *f.is_online.read().unwrap())
+                    .map(|f| format!("{} {}", f.id, f.nickname)).collect::<Vec<_>>();
+                let offline = friend_list.nicknames.iter().map(|n| friend_list.map.get(n).unwrap())
+                    .filter(|f| !*f.is_online.read().unwrap())
+                    .map(|f| format!("{} {}", f.id, f.nickname)).collect::<Vec<_>>();
+                print_normal!(pl, "Online:");
+                for friend in online {
+                    print_normal!(pl, "\t{}", friend);
+                }
+                print_normal!(pl, "Offline:");
+                for friend in offline {
+                    print_normal!(pl, "\t{}", friend);
+                }
+            },
+            Cmd::NewConnection(mut stream) => {
+                let mut buffer = [0; 17];
+                stream.read_exact(&mut buffer).unwrap();
+                let id = Id::from_slice(&buffer[..16]).unwrap();
+                //println!("This someone claims to be {}", id);
+                match friend_list.map_id_nickname.get(&id) {
+                    Some(nickname) => {
+                        info!(pl, "{} connected", nickname);
+                        let friend = friend_list.map.get_mut(nickname).unwrap();
+                        friend.tx.send(FriendCmd::Connected(stream)).unwrap();
+                    },
+                    None => info!(pl, "{} tried to connect, \
+                                  but is not in the friends list", id),
+                }
+            },
+            Cmd::PeerConnect(nickname) => {
+                info!(pl, "{} is online", nickname);
+                if Some(nickname) == current_chat_nickname {
+                    current_chat_nickname = None;
+                }
+            },
+            Cmd::PeerDisconnect(nickname) => info!(pl, "{} is offline", nickname),
+            Cmd::RecvMsg(nickname, msg) => {
+                if current_chat_nickname.is_none() {
+                    tx.send(Cmd::Chat(nickname.clone())).unwrap();
+                }
+                print_msg_them!(pl, nickname, msg);
+            },
             Cmd::Quit => break,
-            Cmd::PeerConnect(id) => unimplemented!(),
-            Cmd::PeerDisconnect(id) => unimplemented!(),
-            Cmd::RecvMsg(nickname, msg) => print_msg_them!(pl, nickname, msg),
         }
     }
 }
@@ -231,9 +437,9 @@ fn main() {
     let (tx, rx) = channel();
 
     let tx1 = tx.clone();
-    let tor_handler_thread = thread::spawn(move || {
+    let main_handler_thread = thread::spawn(move || {
         thread::sleep(Duration::from_secs(1));
-        tor_handler(rl_printer, rx, tx1);
+        main_handler(rl_printer, rx, tx1);
     });
 
     // let readline_thread = thread::spawn(move || {
@@ -257,7 +463,7 @@ fn main() {
                         "/add" => {
                             if args.len() == 3 {
                                 if let Some(id) = Id::from_slice(args[1].as_bytes()) {
-                                    tx.send(Cmd::Add(id, args[1].to_string()))
+                                    tx.send(Cmd::Add(id, args[2].to_string()))
                                         .unwrap();
                                     continue;
                                 }
@@ -302,5 +508,5 @@ fn main() {
     }
     // });
 
-    tor_handler_thread.join().unwrap();
+    main_handler_thread.join().unwrap();
 }
