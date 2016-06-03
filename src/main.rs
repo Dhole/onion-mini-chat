@@ -3,6 +3,7 @@ extern crate env_logger;
 extern crate tor_controller;
 extern crate socks;
 extern crate rustylinez;
+extern crate rand;
 
 use tor_controller::control::{Controller, OnionKey, KeyType, AddOnion};
 use tor_controller::process::TorProcess;
@@ -21,7 +22,45 @@ use std::collections::HashMap;
 use std::io::{BufReader, BufRead, BufWriter};
 use std::net::{TcpListener, TcpStream};
 use std::fmt;
+use rand::Rng;
 
+// Print messages using colors (by using terminal scape codes
+macro_rules! colorize {
+    ($col:expr, $msg:expr) => (concat!("\x1b[38;5;", $col, "m", $msg, "\x1b[0m"));
+}
+
+// Print messages concurrently with the handler given by rustylinez, in color
+macro_rules! print_color {
+    ($pl:expr, $col:expr, $fmt:expr) => ($pl(format!(colorize!($col,  $fmt))));
+    ($pl:expr, $col:expr, $fmt:expr, $($arg:tt)*) => ($pl(format!(colorize!($col, $fmt), $($arg)*)));
+}
+
+macro_rules! print_normal {
+    ($pl:expr, $fmt:expr) => ($pl(format!($fmt)));
+    ($pl:expr, $fmt:expr, $($arg:tt)*) => ($pl(format!($fmt, $($arg)*)));
+}
+
+macro_rules! info {
+    ($pl:expr, $($arg:tt)*) => (print_color!($pl, 244, $($arg)*));
+}
+
+macro_rules! error {
+    ($pl:expr, $($arg:tt)*) => (print_color!($pl, 196, $($arg)*));
+}
+
+macro_rules! print_msg {
+    ($pl:expr, $col:expr, $name:expr, $msg:expr) => ($pl(format!(concat!(colorize!($col,  "{}"), ": {}"), $name, $msg)));
+}
+
+macro_rules! print_msg_me {
+    ($pl:expr, $name:expr, $msg:expr) => (print_msg!($pl, 201, $name, $msg));
+}
+
+macro_rules! print_msg_them {
+    ($pl:expr, $name:expr, $msg:expr) => (print_msg!($pl, 51, $name, $msg));
+}
+
+// User unique ID, corresponds to the Onion service id (which is a hash of the key pair)
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
 struct Id([u8; 16]);
 
@@ -49,6 +88,8 @@ impl Id {
     }
 }
 
+// Stores information about a friend in the friendlist, with a thread handler that handles the
+// connection to this friend.
 struct Friend {
     id: Id,
     nickname: String,
@@ -57,6 +98,7 @@ struct Friend {
     handler: JoinHandle<()>,
 }
 
+// Stores the list of friends and maintains consistency with the friend list file friends.txt
 struct FriendList {
     map: HashMap<String, Friend>,
     nicknames: Vec<String>,
@@ -74,11 +116,10 @@ impl FriendList {
             .create(true)
             .open(path)
             .unwrap();
-        let mut file_lines = Vec::new();
-        {
+        let file_lines = {
             let file_reader = BufReader::new(&file);
-            file_lines = file_reader.lines().map(|l| l.unwrap()).collect::<Vec<_>>();
-        }
+            file_reader.lines().map(|l| l.unwrap()).collect::<Vec<_>>()
+        };
         let mut friend_list = FriendList {
             map: HashMap::new(),
             nicknames: Vec::new(),
@@ -135,6 +176,7 @@ impl FriendList {
     }
 }
 
+// Used to communicate to the friend handler
 #[derive(Debug)]
 enum FriendCmd {
     SendMsg(String),
@@ -142,6 +184,7 @@ enum FriendCmd {
     Disconnected,
 }
 
+// Used to communicate to the main handler (these represent the main events)
 #[derive(Debug)]
 enum Cmd {
     SendMsg(String),
@@ -149,79 +192,83 @@ enum Cmd {
     Add(Id, String),
     List,
     Quit,
-    NewConnection(TcpStream),
-    PeerConnect(String),
-    PeerDisconnect(String),
+    UnknownConnection(TcpStream),
+    NewConnection(Id, TcpStream),
+    FriendConnect(String),
+    FriendDisconnect(String),
     RecvMsg(String, String),
+    InfoMsg(String),
 }
 
-macro_rules! colorize {
-    ($col:expr, $msg:expr) => (concat!("\x1b[38;5;", $col, "m", $msg, "\x1b[0m"));
-}
-
-macro_rules! print_color {
-    ($pl:expr, $col:expr, $fmt:expr) => ($pl(format!(colorize!($col,  $fmt))));
-    ($pl:expr, $col:expr, $fmt:expr, $($arg:tt)*) => ($pl(format!(colorize!($col, $fmt), $($arg)*)));
-}
-
-macro_rules! print_normal {
-    ($pl:expr, $fmt:expr) => ($pl(format!($fmt)));
-    ($pl:expr, $fmt:expr, $($arg:tt)*) => ($pl(format!($fmt, $($arg)*)));
-}
-
-macro_rules! info {
-    ($pl:expr, $($arg:tt)*) => (print_color!($pl, 244, $($arg)*));
-}
-
-macro_rules! error {
-    ($pl:expr, $($arg:tt)*) => (print_color!($pl, 196, $($arg)*));
-}
-
-macro_rules! print_msg {
-    ($pl:expr, $col:expr, $name:expr, $msg:expr) => ($pl(format!(concat!(colorize!($col,  "{}"), ": {}"), $name, $msg)));
-}
-
-macro_rules! print_msg_me {
-    ($pl:expr, $name:expr, $msg:expr) => (print_msg!($pl, 51, $name, $msg));
-}
-
-macro_rules! print_msg_them {
-    ($pl:expr, $name:expr, $msg:expr) => (print_msg!($pl, 201, $name, $msg));
-}
-
+// Keep trying to connect to friend_id.onion, return the TcpStream after a connection has been
+// stablished.  Whoever has the smallest id acts as hidden service in the returned connection.
 fn connect_friend(own_id: Id,
                   friend_id: Id,
                   rx: &Receiver<FriendCmd>) -> TcpStream {
-    if own_id < friend_id {
         loop {
             //println!("Trying to connecto to {}", friend_id);
             match Socks5Stream::connect(("127.0.0.1", 9060),
-            (format!("{}", friend_id.to_onion()).as_str(), 9876)) {
-                Ok(stream) => {
+                                        (format!("{}", friend_id.to_onion()).as_str(), 9876)) {
+                Ok(stream_out) => {
                     //println!("Connected to {}!", friend_id);
-                    let mut stream = stream.into_inner();
-                    stream.write_all(format!("{}\n", own_id).as_bytes()).unwrap();
-                    stream.flush().unwrap();
-                    return stream;
+                    // First we send our id
+                    let mut stream_out = stream_out.into_inner();
+                    stream_out.write_all(format!("{}\n", own_id).as_bytes()).unwrap();
+                    stream_out.flush().unwrap();
+                    if own_id < friend_id {
+                        // We use our connection to their hidden service.  They authenticate us.
+                        // We just echo the secret we receive from our connection to the connection
+                        // they made.
+                        match rx.recv().unwrap() {
+                            FriendCmd::Connected(mut stream_in) => {
+                                let mut buffer = [0 as u8; 32];
+                                //println!("Reciving a secret from {}", friend_id);
+                                if let Err(_) = stream_in.read_exact(&mut buffer) {
+                                    continue;
+                                }
+                                //println!("Sending a secret to {}", friend_id);
+                                if let Err(_) = stream_out.write_all(&buffer) {
+                                    continue;
+                                }
+                                return stream_out;
+                            },
+                            _ => (),
+                        }
+                    } else {
+                        // We use their connection to our hidden service.  We authenticate them.
+                        // To authenticate, we send a random secret to the connection we made and
+                        // expect the same secret back from the connection they made.
+                        //println!("Waiting connection from {}", friend_id);
+                        match rx.recv().unwrap() {
+                            FriendCmd::Connected(mut stream_in) => {
+                                //println!("{} connected to us!", friend_id);
+                                let mut rng = rand::thread_rng();
+                                let secret = rng.gen::<[u8; 32]>();
+                                //println!("Sending a secret to {}", friend_id);
+                                if let Err(_) = stream_out.write_all(&secret) {
+                                    continue;
+                                }
+                                let mut buffer = [0 as u8; 32];
+                                //println!("Reciving a secret from {}", friend_id);
+                                if let Err(_) = stream_in.read_exact(&mut buffer) {
+                                    continue;
+                                }
+                                if secret == buffer {
+                                    //println!("Secret from {} matches!", friend_id);
+                                    return stream_in;
+                                }
+                            }
+                            _ => (),
+                        }
+                    }
                 },
                 Err(_) => (),
             }
             thread::sleep(Duration::from_secs(5));
         }
-    } else {
-        loop {
-            //println!("Waiting connection from {}", friend_id);
-            match rx.recv().unwrap() {
-                FriendCmd::Connected(stream) => {
-                    //println!("{} connected to us!", friend_id);
-                    return stream;
-                }
-                _ => (),
-            }
-        }
-    }
 }
 
+// Handle the connection to a friend, and notify the main handler when they are online/offline.
 fn friend_handler(own_id: Id,
                   friend_id: Id,
                   nickname: String,
@@ -238,7 +285,7 @@ fn friend_handler(own_id: Id,
         let reader = BufReader::new(stream.try_clone().unwrap());
         let mut writer = BufWriter::new(stream.try_clone().unwrap());
         *is_online.write().unwrap() = true;
-        main_tx.send(Cmd::PeerConnect(nickname.clone())).unwrap();
+        main_tx.send(Cmd::FriendConnect(nickname.clone())).unwrap();
 
         let nickname1 = nickname.clone();
         let reader_handler = thread::spawn(move || {
@@ -272,7 +319,7 @@ fn friend_handler(own_id: Id,
         tx = tx1;
 
         *is_online.write().unwrap() = false;
-        main_tx.send(Cmd::PeerDisconnect(nickname.clone())).unwrap();
+        main_tx.send(Cmd::FriendDisconnect(nickname.clone())).unwrap();
     }
 }
 
@@ -287,6 +334,7 @@ fn main_handler(printer: Printer, rx: Receiver<Cmd>, tx: Sender<Cmd>) {
     let mut controller = Controller::from_port(9061).unwrap();
     controller.authenticate().unwrap();
 
+    // We read the private key from key.txt or generate a new one if it doesn't exist.
     let mut new_key = false;
     let onion_key = match File::open("key.txt") {
         Ok(ref mut key_file) => {
@@ -331,6 +379,7 @@ fn main_handler(printer: Printer, rx: Receiver<Cmd>, tx: Sender<Cmd>) {
         }
     }
 
+    // This thread keeps listening for incomming connection and sends them to the main handler.
     let tx1 = tx.clone();
     thread::spawn(move || {
         let listener = TcpListener::bind(("127.0.0.1", 9876)).unwrap();
@@ -338,7 +387,7 @@ fn main_handler(printer: Printer, rx: Receiver<Cmd>, tx: Sender<Cmd>) {
             match stream {
                 Ok(stream) => {
                     //println!("Someone has tried connecting to us!");
-                    tx1.send(Cmd::NewConnection(stream)).unwrap();
+                    tx1.send(Cmd::UnknownConnection(stream)).unwrap();
                 }
                 Err(e) => (),
             }
@@ -348,9 +397,14 @@ fn main_handler(printer: Printer, rx: Receiver<Cmd>, tx: Sender<Cmd>) {
     let mut current_chat_nickname: Option<String> = None;
     let tx1 = tx.clone();
     let mut friend_list = FriendList::new("friends.txt", own_id, tx1);
+    // This is the main handler loop, listening for events.
     loop {
         match rx.recv().unwrap() {
             Cmd::SendMsg(msg) => {
+                // Send a message to the current selected nickname.
+                if msg == "" {
+                    continue;
+                }
                 if let Some(ref nickname) = current_chat_nickname {
                     let friend = friend_list.map.get_mut(nickname).unwrap();
                     friend.tx.send(FriendCmd::SendMsg(msg.clone())).unwrap();
@@ -358,12 +412,14 @@ fn main_handler(printer: Printer, rx: Receiver<Cmd>, tx: Sender<Cmd>) {
                 }
             }
             Cmd::Add(id, nickname) => {
+                // Add a new friend to the friend_list.
                 if !friend_list.add_friend(id, nickname.clone(), true) {
                     error!(pl, "Error adding friend: nickname {} already found in your list",
                            nickname);
                 }
             }
             Cmd::Chat(nickname) => {
+                // Select a friend to chat.
                 if !friend_list.map.contains_key(&nickname) {
                     error!(pl, "No friend found with nickname {}", nickname);
                     continue;
@@ -376,6 +432,7 @@ fn main_handler(printer: Printer, rx: Receiver<Cmd>, tx: Sender<Cmd>) {
                 info!(pl, "Currently chatting with {}", nickname);
             },
             Cmd::List => {
+                // List the friend_list, separating online and offline friends.
                 let online = friend_list.nicknames.iter().map(|n| friend_list.map.get(n).unwrap())
                     .filter(|f| *f.is_online.read().unwrap())
                     .map(|f| format!("{} {}", f.id, f.nickname)).collect::<Vec<_>>();
@@ -391,34 +448,50 @@ fn main_handler(printer: Printer, rx: Receiver<Cmd>, tx: Sender<Cmd>) {
                     print_normal!(pl, "\t{}", friend);
                 }
             },
-            Cmd::NewConnection(mut stream) => {
-                let mut buffer = [0; 17];
-                stream.read_exact(&mut buffer).unwrap();
-                let id = Id::from_slice(&buffer[..16]).unwrap();
-                //println!("This someone claims to be {}", id);
+            Cmd::UnknownConnection(mut stream) => {
+                // Someone has connected to us, handle this connection.
+                let tx1 = tx.clone();
+                thread::spawn(move ||{
+                    let mut buffer = [0; 17];
+                    stream.read_exact(&mut buffer).unwrap();
+                    let id = Id::from_slice(&buffer[..16]).unwrap();
+                    tx1.send(Cmd::NewConnection(id, stream)).unwrap();
+                    //println!("This someone claims to be {}", id);
+                });
+            },
+            Cmd::NewConnection(id, stream) => {
                 match friend_list.map_id_nickname.get(&id) {
                     Some(nickname) => {
-                        info!(pl, "{} connected", nickname);
+                        //info!(pl, "{} connected", nickname);
                         let friend = friend_list.map.get_mut(nickname).unwrap();
                         friend.tx.send(FriendCmd::Connected(stream)).unwrap();
                     },
                     None => info!(pl, "{} tried to connect, \
                                   but is not in the friends list", id),
                 }
-            },
-            Cmd::PeerConnect(nickname) => {
+            }
+            Cmd::FriendConnect(nickname) => {
+                // Notify that we connected to a friend succesfully.
                 info!(pl, "{} is online", nickname);
+            },
+            Cmd::FriendDisconnect(nickname) => {
+                // Notify that we lost communication to a friend.
+                info!(pl, "{} is offline", nickname);
                 if Some(nickname) == current_chat_nickname {
                     current_chat_nickname = None;
                 }
-            },
-            Cmd::PeerDisconnect(nickname) => info!(pl, "{} is offline", nickname),
+            }
             Cmd::RecvMsg(nickname, msg) => {
+                // We receive a message from nickname (this comes from the friend_handler).
                 if current_chat_nickname.is_none() {
                     tx.send(Cmd::Chat(nickname.clone())).unwrap();
                 }
                 print_msg_them!(pl, nickname, msg);
             },
+            Cmd::InfoMsg(msg) => {
+                // Show an information message
+                info!(pl, "{}", msg);
+            }
             Cmd::Quit => break,
         }
     }

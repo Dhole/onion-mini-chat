@@ -3,6 +3,7 @@ name = "onion-mini-chat"
 version = "0.1.0"
 dependencies = [
  "env_logger 0.3.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rand 0.3.14 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustylinez 0.2.2",
  "socks 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "tor_controller 0.1.0",
